@@ -122,7 +122,6 @@ class  AccumulatorExample(opcodes: OpcodeSet, val n: Int = 4)(implicit p: Parame
 
 class AccumulatorExampleModuleImp(outer: AccumulatorExample)(implicit p: Parameters) extends LazyRoCCModuleImp(outer)
     with HasCoreParameters {
-  val regfile = Mem(outer.n, UInt(width = xLen))
   val busy = Reg(init = Vec.fill(outer.n){Bool(false)})
 
   val cmd = Queue(io.cmd)
@@ -132,19 +131,38 @@ class AccumulatorExampleModuleImp(outer: AccumulatorExample)(implicit p: Paramet
   val doRead = funct === UInt(1)
   val doLoad = funct === UInt(2)
   val doAccum = funct === UInt(3)
+  val doClear = funct === UInt(4)
   val memRespTag = io.mem.resp.bits.tag(log2Up(outer.n)-1,0)
 
   // datapath
+  val arg1  = Reg(UInt(width = xLen))
+  val arg2  = Reg(UInt(width = xLen))
+  val dotP  = RegInit(0.U)
   val addend = cmd.bits.rs1
-  val accum = regfile(addr)
-  val wdata = Mux(doWrite, addend, accum + addend)
+  val wdata = arg1 * arg2
+  val route_mem = RegInit(false.B)
 
-  when (cmd.fire() && (doWrite || doAccum)) {
-    regfile(addr) := wdata
+  when (cmd.fire() && doAccum) {
+    dotP := dotP + wdata
+  }
+
+  when (cmd.fire() && doClear) {
+    dotP := 0.U
+    arg1 := 0.U
+    arg2 := 0.U
+  }
+
+  when (cmd.fire() && doWrite) {
+    route_mem := true.B
   }
 
   when (io.mem.resp.valid) {
-    regfile(memRespTag) := io.mem.resp.bits.data
+    when (route_mem) {
+      arg2 := io.mem.resp.bits.data
+      route_mem := false.B
+    } .otherwise {
+    arg1 := io.mem.resp.bits.data
+    }
     busy(memRespTag) := Bool(false)
   }
 
@@ -155,7 +173,7 @@ class AccumulatorExampleModuleImp(outer: AccumulatorExample)(implicit p: Paramet
 
   val doResp = cmd.bits.inst.xd
   val stallReg = busy(addr)
-  val stallLoad = doLoad && !io.mem.req.ready
+  val stallLoad = (doWrite || doLoad) && !io.mem.req.ready
   val stallResp = doResp && !io.resp.ready
 
   cmd.ready := !stallReg && !stallLoad && !stallResp
@@ -166,7 +184,7 @@ class AccumulatorExampleModuleImp(outer: AccumulatorExample)(implicit p: Paramet
     // valid response if valid command, need a response, and no stalls
   io.resp.bits.rd := cmd.bits.inst.rd
     // Must respond with the appropriate tag or undefined behavior
-  io.resp.bits.data := accum
+  io.resp.bits.data := dotP
     // Semantics is to always send out prior accumulator register value
 
   io.busy := cmd.valid || busy.reduce(_||_)
@@ -175,7 +193,7 @@ class AccumulatorExampleModuleImp(outer: AccumulatorExample)(implicit p: Paramet
     // Set this true to trigger an interrupt on the processor (please refer to supervisor documentation)
 
   // MEMORY REQUEST INTERFACE
-  io.mem.req.valid := cmd.valid && doLoad && !stallReg && !stallResp
+  io.mem.req.valid := cmd.valid && (doLoad || doWrite) && !stallReg && !stallResp
   io.mem.req.bits.addr := addend
   io.mem.req.bits.tag := addr
   io.mem.req.bits.cmd := M_XRD // perform a load (M_XWR for stores)
