@@ -122,25 +122,169 @@ class  AccumulatorExample(opcodes: OpcodeSet, val n: Int = 4)(implicit p: Parame
 
 class AccumulatorExampleModuleImp(outer: AccumulatorExample)(implicit p: Parameters) extends LazyRoCCModuleImp(outer)
     with HasCoreParameters {
-  val busy = Reg(init = Vec.fill(outer.n){Bool(false)})
+  val mem_busy = RegInit(false.B)
 
   val cmd = Queue(io.cmd)
   val funct = cmd.bits.inst.funct
-  val addr = cmd.bits.rs2(log2Up(outer.n)-1,0)
   val doWrite = funct === UInt(0)
   val doRead = funct === UInt(1)
   val doLoad = funct === UInt(2)
   val doAccum = funct === UInt(3)
   val doClear = funct === UInt(4)
-  val memRespTag = io.mem.resp.bits.tag(log2Up(outer.n)-1,0)
 
+  // controlpath
+  val sIdle :: sLoad :: sWrite :: sAccum :: sClear :: sRead :: Nil = Enum(6)
+  val state = RegInit(sIdle)
+
+  val arg1  = RegInit(Vec(Seq.fill(256)(0.U(8.W))))
+  val arg2  = RegInit(Vec(Seq.fill(256)(0.U(8.W))))
+  val arg_valid = RegInit(Vec(Seq.fill(256)(false.B)))
+  val dotP  = RegInit(0.U(16.W))
+  val mem_addr = Reg(UInt(width = xLen))
+  val idx   = RegInit(0.U(32.W))
+  val arg_count = RegInit(0.U(32.W))
+  val addend = cmd.bits.rs1
+
+  val stallLoad = (!io.mem.req.ready || (state === sLoad) || (state === sWrite))
+  val stallResp = !io.resp.ready && cmd.bits.inst.xd
+  val stallComp = ((state === sAccum) || (state === sClear))
+
+  cmd.ready := !stallLoad && !stallResp && !stallComp
+
+  io.resp.valid := cmd.valid && !stallResp && !stallLoad && (state === sIdle)
+  io.resp.bits.rd := cmd.bits.inst.rd
+  io.resp.bits.data := dotP
+  io.busy := cmd.valid
+  io.interrupt := Bool(false)
+
+  // State Logic - Load and Write Initialization
+  when(cmd.fire() && (state === sIdle)) {
+    when(doLoad) {
+      state     := sLoad
+      mem_addr  := cmd.bits.rs1
+      arg_count := cmd.bits.rs2
+    } .elsewhen(doWrite) {
+      state     := sWrite
+      mem_addr  := cmd.bits.rs1
+      arg_count := cmd.bits.rs2
+    } .elsewhen(doAccum) {
+      state := sAccum
+    } .elsewhen(doClear) {
+      state := sClear
+    } .elsewhen(doRead) {
+      printf("dotP = %d\n",dotP)
+    }
+  }
+  val products = Wire(Vec(256, UInt(16.W)))
+  for(i <- 0 until 256) {
+    products(i) := arg1(i) * arg2(i)
+  }
+
+  val adder_idx = RegInit(0.U(32.W))
+
+  when (state === sAccum && adder_idx < arg_count) {
+      when(arg_valid(adder_idx)) {
+        printf("arg1(%d) = %d, arg2(%d) = %d, arg_valid(%d) = %b\n",idx,arg1(idx),idx, arg2(idx),idx,arg_valid(idx))
+        dotP := dotP + (products(adder_idx))
+        printf("dotP = %d\n", dotP)
+        adder_idx := adder_idx + 1.U
+    }
+  } .elsewhen(state === sAccum && adder_idx >= arg_count) {
+    adder_idx := 0.U
+    state := sIdle
+  }
+
+  when (state === sClear) {
+    dotP      := 0.U
+    arg1      := Vec(Seq.fill(256)(0.U(8.W)))
+    arg2      := Vec(Seq.fill(256)(0.U(8.W)))
+    arg_valid := Vec(Seq.fill(256)(false.B))
+    arg_count := 0.U
+    idx       := 0.U
+    mem_addr  := 0.U
+    state     := sIdle
+  }
+
+  val load_done = (idx >= arg_count)
+
+  // State Logic - Sending read requests to memory
+  io.mem.req.bits.addr  := mem_addr
+  io.mem.req.bits.tag   := mem_addr
+  io.mem.req.bits.cmd   := M_XRD
+  io.mem.req.bits.typ   := MT_B
+  io.mem.req.bits.data  := Bits(0)
+  io.mem.req.valid      := !stallResp && !mem_busy && (state === sLoad || state === sWrite) && !load_done
+
+  // State Logic - Handling data read from memory
+  when(state === sLoad && load_done) {
+    state := sIdle
+    idx   := 0.U
+    printf("load done\n")
+  } .elsewhen(state === sLoad && io.mem.resp.valid) {
+    printf("loaded one\n")
+    arg1(idx)       := io.mem.resp.bits.data
+    arg_valid(idx)  := true.B
+    idx             := idx + 1.U
+    mem_busy        := false.B
+    mem_addr        := mem_addr + 1.U
+  }
+
+  when(state === sWrite && load_done) {
+    state := sIdle
+    idx   := 0.U
+    printf("write done\n")
+  } .elsewhen(state === sWrite && io.mem.resp.valid) {
+    printf("written\n")
+    arg2(idx)       := io.mem.resp.bits.data
+    arg_valid(idx)  := true.B
+    idx             := idx + 1.U
+    mem_busy        := false.B
+    mem_addr        := mem_addr + 1.U
+    printf("%b, %d, %d\n",load_done, arg_count, idx)
+  }
+
+  /*
+  when(io.mem.resp.valid) {
+    when(state === sLoad) {
+      arg1(idx)       := io.mem.resp.bits.data
+      arg_valid(idx)  := true.B
+      idx := idx + 1.U
+      mem_busy := false.B
+      when(load_done) {
+        state := sIdle
+        idx   := 0.U
+      }.otherwise {
+        mem_addr := mem_addr + 1.U
+      }
+    } .elsewhen(state === sWrite) {
+      arg2(idx)       := io.mem.resp.bits.data
+      arg_valid(idx)  := true.B
+      idx := idx + 1.U
+      mem_busy := false.B
+      when(load_done) {
+        state := sIdle
+        idx   := 0.U
+      } .otherwise {
+        mem_addr := mem_addr + 1.U
+      }
+    }
+  }
+  */
+  // Memory Controller
+  when(io.mem.req.fire()) {
+    mem_busy := true.B
+  }
   // datapath
-  val arg1  = Reg(UInt(width = xLen))
-  val arg2  = Reg(UInt(width = xLen))
+/*
+  val arg1  = RegInit(Vec(Seq.fill(n)(0.U(32.W))))
+  val arg2  = RegInit(Vec(Seq.fill(n)(0.U(32.W))))
   val dotP  = RegInit(0.U)
+  val mem_addr = Reg(UInt(width = xLen))
   val addend = cmd.bits.rs1
   val wdata = arg1 * arg2
   val route_mem = RegInit(false.B)
+
+
 
   when (cmd.fire() && doAccum) {
     dotP := dotP + wdata
@@ -200,6 +344,7 @@ class AccumulatorExampleModuleImp(outer: AccumulatorExample)(implicit p: Paramet
   io.mem.req.bits.typ := MT_D // D = 8 bytes, W = 4, H = 2, B = 1
   io.mem.req.bits.data := Bits(0) // we're not performing any stores...
   io.mem.req.bits.phys := Bool(false)
+*/
 }
 
 class  TranslatorExample(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes, nPTWPorts = 1) {
